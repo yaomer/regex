@@ -260,8 +260,8 @@ private:
             if (node.childs.size() == 2) nfa.concat(build(node.childs[1])); // term -> factor term
             break;
         case Factor:
-            nfa = build(node.childs[0]);
-            if (node.childs.size() == 2) {
+            nfa = build(node.childs[0]); // factor -> atom
+            if (node.childs.size() == 2) { // factor -> atom meta-char
                 int metachar = node.childs[1].type;
                 switch (metachar) {
                 case '*': nfa.closure(); break;
@@ -276,7 +276,7 @@ private:
             break;
         case Char:
             if (node.childs.size() == 1) nfa = NFA(node.childs[0].type); // char -> any-char-except-meta
-            else return NFA(node.childs[1].type); // char -> '\'any-char
+            else nfa = NFA(node.childs[1].type); // char -> '\'any-char
             break;
         default:
             assert(0);
@@ -287,12 +287,12 @@ private:
     //       | term
     tree_node expr()
     {
-        auto node = term();
+        auto term_node = term();
         if (!eof() && peek() == '|') {
             match('|');
-            return tree_node(Expr, { node, tree_node('|'), expr() });
+            return tree_node(Expr, { term_node, tree_node('|'), expr() });
         }
-        return tree_node(Expr, { node });
+        return tree_node(Expr, { term_node });
     }
     // term -> factor term
     //       | factor
@@ -356,18 +356,22 @@ public:
     matcher& operator=(const matcher&) = delete;
     bool build(const std::string& expr)
     {
+        if (expr.empty()) return false;
         return builder->build(nfa, expr);
     }
     bool match(const std::string& s)
     {
-        return search(nfa.start, s, 0);
+        for (int i = 0; i < s.size(); i++)
+            if (search(nfa.start, s, i))
+                return true;
+        return false;
     }
 private:
     // 朴素的DFS，最坏时间复杂度为O(2^n)
     bool search(nfa_state *state, const std::string& s, int i)
     {
+        if (state->isend) return true;
         if (i == s.size()) {
-            if (state->isend) return true;
             for (auto& state : state->epsilon_edges) {
                 if (search(state, s, i)) return true;
             }
