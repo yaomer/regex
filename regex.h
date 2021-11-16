@@ -38,13 +38,13 @@ struct NFA {
     {
         start->add_symbol_trans(symbol, end);
     }
-    void concat(NFA& nfa)
+    void concat(NFA nfa)
     {
         end->add_epsilon_trans(nfa.start);
         end->isend = false;
         end = nfa.end;
     }
-    void Union(NFA& nfa)
+    void Union(NFA nfa)
     {
         auto new_start = new nfa_state(false);
         auto new_end = new nfa_state(true);
@@ -75,11 +75,11 @@ struct NFA {
         start = new_start;
         end = new_end;
     }
-    void zero_or_one()
+    void zero_or_one() // ?
     {
         start->add_epsilon_trans(end);
     }
-    void one_or_more()
+    void one_or_more() // +
     {
         closure(true);
     }
@@ -87,13 +87,22 @@ struct NFA {
     nfa_state *start, *end;
 };
 
+//====================================================//
+
 struct builder {
-    virtual NFA build(const std::string& expr) = 0;
+    virtual bool build(NFA& nfa, const std::string& expr) = 0;
     virtual ~builder() = default;
 };
 
+// 通过后缀表达式来构建NFA
 struct postfix_builder : builder {
-    NFA build(const std::string& expr) override
+    bool build(NFA& nfa, const std::string& expr) override
+    {
+        nfa = build(expr);
+        return true;
+    }
+private:
+    NFA build(const std::string& expr)
     {
         NFA nfa;
         std::stack<NFA> stk;
@@ -125,9 +134,8 @@ struct postfix_builder : builder {
         assert(stk.size() == 1);
         return stk.top();
     }
-private:
-    // 添加显式的联结符'.'
-    // ab -> a.b
+    // 添加显式的联结符'.' (ab -> a.b)
+    // (ps: 所以我们无法处理元字符'.'了)
     // REQ: 合法的正则表达式expr
     std::string add_concat_operator(const std::string& expr)
     {
@@ -184,14 +192,171 @@ private:
     }
 };
 
+// 这里我们通过生成抽象语法树(AST)来构建NFA
+//
+// 我们用BNF来描述我们的正则表达式，基本思路就是为每个优先级的运算符都引入一个产生式
+// 优先级越高的应该越靠后，也即它会出现在AST中越底部的位置。
+//
+// 由于正则表达式的|*?+等基本运算符都是右结合的，因此我们可以很容易写出它的文法，
+// 并用递归下降的方法来解析生成AST。
+//
+// expr -> term '|' expr
+//       | term
+// term -> factor term
+//       | factor
+// factor -> atom meta-char
+//         | atom
+// atom -> char | (expr)
+//
+// char -> any-char-except-meta
+//       | '\'any-char
+// meta-char -> '*' | '?' | '+'
+//
+// <expr> for union
+// <term> for concat
+// <factor> for meta-char
+// <atom>为正则表达式执行的基本单元，是不可分割的。
+// <char>用于区分转义字符和非转义字符。
+//
+struct ast_builder : builder {
+    bool build(NFA& nfa, const std::string& expr) override
+    {
+        p = expr.data(), end = p + expr.size();
+        try {
+            auto root = this->expr();
+            nfa =  build(root);
+        } catch (parse_error_code& code) {
+            return false;
+        }
+        return true;
+    }
+private:
+    enum node_type {
+        Expr = 256, Term, Factor, Atom, Char
+    };
+
+    struct tree_node {
+        tree_node(int type) : type(type) {  }
+        tree_node(int type, std::initializer_list<tree_node> il)
+            : type(type), childs(il) {  }
+        int type;
+        std::vector<tree_node> childs;
+    };
+
+    typedef const int parse_error_code;
+    static parse_error_code parse_error = -1;
+
+    // 沿AST自顶向下构建NFA
+    NFA build(tree_node& node)
+    {
+        NFA nfa;
+        switch (node.type) {
+        case Expr:
+            nfa = build(node.childs[0]); // expr -> term
+            if (node.childs.size() == 3) nfa.Union(build(node.childs[2])); // expr -> term '|' expr
+            break;
+        case Term:
+            nfa = build(node.childs[0]); // term -> factor
+            if (node.childs.size() == 2) nfa.concat(build(node.childs[1])); // term -> factor term
+            break;
+        case Factor:
+            nfa = build(node.childs[0]);
+            if (node.childs.size() == 2) {
+                int metachar = node.childs[1].type;
+                switch (metachar) {
+                case '*': nfa.closure(); break;
+                case '?': nfa.zero_or_one(); break;
+                case '+': nfa.one_or_more(); break;
+                }
+            }
+            break;
+        case Atom:
+            if (node.childs.size() == 1) nfa = build(node.childs[0]); // atom -> char
+            else nfa = build(node.childs[1]); // atom -> (expr)
+            break;
+        case Char:
+            if (node.childs.size() == 1) nfa = NFA(node.childs[0].type); // char -> any-char-except-meta
+            else return NFA(node.childs[1].type); // char -> '\'any-char
+            break;
+        default:
+            assert(0);
+        }
+        return nfa;
+    }
+    // expr -> term '|' expr
+    //       | term
+    tree_node expr()
+    {
+        auto node = term();
+        if (!eof() && peek() == '|') {
+            match('|');
+            return tree_node(Expr, { node, tree_node('|'), expr() });
+        }
+        return tree_node(Expr, { node });
+    }
+    // term -> factor term
+    //       | factor
+    tree_node term()
+    {
+        auto factor_node = factor();
+        // expr() needs to match '|'
+        // atom() needs to match ')'
+        if (!eof() && peek() != '|' && peek() != ')') {
+            return tree_node(Term, { factor_node, term() });
+        }
+        return tree_node(Term, { factor_node });
+    }
+    // factor -> atom meta-char
+    //         | atom
+    tree_node factor()
+    {
+        auto atom_node = atom();
+        if (!eof() && ismetachar(peek())) {
+            return tree_node(Factor, { atom_node, tree_node(nextchar()) });
+        }
+        return tree_node(Factor, { atom_node });
+    }
+    // atom -> char | (expr)
+    tree_node atom()
+    {
+        if (peek() == '(') {
+            match('(');
+            auto expr_node = expr();
+            match(')');
+            return tree_node(Atom, { tree_node('('), expr_node, tree_node(')') });
+        }
+        return tree_node(Atom, { character() });
+    }
+    tree_node character()
+    {
+        if (ismetachar(peek())) throw parse_error;
+        if (peek() == '\\') {
+            match('\\');
+            return tree_node(Char, { tree_node('\\'), tree_node(nextchar()) });
+        }
+        return tree_node(Char, { tree_node(nextchar()) });
+    }
+
+    int peek() { return *p; }
+    int nextchar() { return *p++; }
+    bool eof() { return p == end; }
+    bool ismetachar(int c) { return strchr("*?+", c); }
+    void match(int c)
+    {
+        if (peek() != c) throw parse_error;
+        nextchar();
+    }
+    const char *p, *end;
+};
+
 class matcher {
 public:
-    matcher() : builder(new postfix_builder()) {  }
+    matcher() : builder(new ast_builder()) {  }
     matcher(const matcher&) = delete;
     matcher& operator=(const matcher&) = delete;
-    void build(const std::string& expr)
+    bool build(const std::string& expr)
     {
-        nfa = builder->build(expr);
+        return builder->build(nfa, expr);
     }
     bool match(const std::string& s)
     {
@@ -207,7 +372,7 @@ private:
                 if (search(state, s, i)) return true;
             }
         } else {
-            if (state->symbol == s[i]) {
+            if ((state->symbol == '.' && s[i] != '\n') || state->symbol == s[i]) {
                 if (search(state->to, s, i + 1)) return true;
             } else {
                 for (auto& state : state->epsilon_edges) {
