@@ -5,27 +5,47 @@
 #include <string>
 #include <stack>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace regex {
 
 // 我们使用Thompson算法构造一个NFA，其构造出的NFA有以下特点：
 // 1) N(r)(由表达式r构成的NFA)有且只有一个开始状态和接受状态，开始状态没有入边，接受状态没有出边。
 // 2) N(r)中除接受状态以外的每个状态要么有一条symbol出边，要么至多有两条epsilon出边。
+// *) 我们加入[]支持后，一条symbol出边上可能会有多个symbol，不过它们都转向同一个状态。
 
 struct nfa_state {
+    enum { Single, Charset, CharsetNot }; // single-symbol-trans, [], [^]
+    enum { AnchorNone, AnchorStart, AnchorEnd }; // ^ $
     nfa_state(bool isend) : isend(isend) {  }
+    bool is_anchor_start() { return anchor_type == AnchorStart; }
+    bool is_anchor_end() { return anchor_type == AnchorEnd; }
     void add_epsilon_trans(nfa_state *to)
     {
         epsilon_edges.emplace_back(to);
     }
     void add_symbol_trans(char symbol, nfa_state *to)
     {
-        this->symbol = symbol;
+        symbols.emplace(symbol);
         this->to = to;
+    }
+    bool can_symbol_trans(char symbol)
+    {
+        assert(!isend);
+        switch (symbol_type) {
+        case Charset: return symbols.count(symbol);
+        case CharsetNot: return !symbols.count(symbol);
+        case Single:
+            if (symbols.empty()) return false;
+            return (*symbols.begin() == '.' && symbol != '\n') || (*symbols.begin() == symbol);
+        default: assert(0);
+        }
     }
     bool isend; // 是否为接受状态
     std::vector<nfa_state*> epsilon_edges; // 1 or 2
-    char symbol = '\0';
+    int symbol_type = Single;
+    int anchor_type = AnchorNone;
+    std::unordered_set<char> symbols;
     nfa_state *to = nullptr;
 };
 
@@ -37,6 +57,19 @@ struct NFA {
     NFA(char symbol) : start(new nfa_state(false)), end(new nfa_state(true))
     {
         start->add_symbol_trans(symbol, end);
+    }
+    NFA(char symbol, int symbol_type) : start(new nfa_state(false)), end(new nfa_state(true))
+    {
+        start->add_symbol_trans(symbol, end);
+        start->symbol_type = symbol_type;
+    }
+    void set_anchor_start()
+    {
+        start->anchor_type = nfa_state::AnchorStart;
+    }
+    void set_anchor_end()
+    {
+        end->anchor_type = nfa_state::AnchorEnd;
     }
     void concat(NFA nfa)
     {
@@ -197,22 +230,26 @@ private:
 // 我们用BNF来描述我们的正则表达式，基本思路就是为每个优先级的运算符都引入一个产生式
 // 优先级越高的应该越靠后，也即它会出现在AST中越底部的位置。
 //
-// 由于正则表达式的|*?+等基本运算符都是右结合的，因此我们可以很容易写出它的文法，
+// 由于正则表达式的(|*?+)等基本运算符都是右结合的，因此我们可以很容易写出它的文法，
 // 并用递归下降的方法来解析生成AST。
 //
-// expr -> term '|' expr
-//       | term
+// expr -> anchor '|' expr
+//       | anchor
+// anchor -> '^' anchor
+//         | term '$'
+//         | term
 // term -> factor term
 //       | factor
 // factor -> atom meta-char
 //         | atom
-// atom -> char | (expr)
+// atom -> char | (expr) | [charset]
 //
 // char -> any-char-except-meta
 //       | '\'any-char
 // meta-char -> '*' | '?' | '+'
 //
 // <expr> for union
+// <anchor> for '^' '$'
 // <term> for concat
 // <factor> for meta-char
 // <atom>为正则表达式执行的基本单元，是不可分割的。
@@ -232,7 +269,7 @@ struct ast_builder : builder {
     }
 private:
     enum node_type {
-        Expr = 256, Term, Factor, Atom, Char
+        Expr = 256, Anchor, Term, Factor, Atom, Char
     };
 
     struct tree_node {
@@ -240,6 +277,7 @@ private:
         tree_node(int type, std::initializer_list<tree_node> il)
             : type(type), childs(il) {  }
         int type;
+        int anchor = 0;
         std::vector<tree_node> childs;
     };
 
@@ -252,8 +290,19 @@ private:
         NFA nfa;
         switch (node.type) {
         case Expr:
-            nfa = build(node.childs[0]); // expr -> term
-            if (node.childs.size() == 3) nfa.Union(build(node.childs[2])); // expr -> term '|' expr
+            nfa = build(node.childs[0]); // expr -> anchor
+            if (node.childs.size() == 3) nfa.Union(build(node.childs[2])); // expr -> anchor '|' expr
+            break;
+        case Anchor:
+            if (node.childs[0].type == Term) {
+                nfa = build(node.childs[0]); // anchor -> term
+                if (node.childs.size() == 2) { // anchor -> term '$'
+                    nfa.set_anchor_end();
+                }
+            } else { // anchor -> '^' anchor
+                nfa = build(node.childs[1]);
+                nfa.set_anchor_start();
+            }
             break;
         case Term:
             nfa = build(node.childs[0]); // term -> factor
@@ -271,28 +320,88 @@ private:
             }
             break;
         case Atom:
-            if (node.childs.size() == 1) nfa = build(node.childs[0]); // atom -> char
-            else nfa = build(node.childs[1]); // atom -> (expr)
+            if (node.childs.size() == 1) {
+                nfa = build(node.childs[0]); // atom -> char
+            } else if (node.childs[0].type == '(') {
+                nfa = build(node.childs[1]); // atom -> (expr)
+            } else { // atom -> [charset]
+                nfa = build_from_charset(node);
+            }
             break;
         case Char:
-            if (node.childs.size() == 1) nfa = NFA(node.childs[0].type); // char -> any-char-except-meta
-            else nfa = NFA(node.childs[1].type); // char -> '\'any-char
+            if (node.childs.size() == 1) { // char -> any-char-except-meta
+                nfa = NFA(node.childs[0].type);
+            } else { // char -> '\'any-char
+                return build_from_escape(node.childs[1].type);
+            }
             break;
         default:
             assert(0);
         }
         return nfa;
     }
-    // expr -> term '|' expr
-    //       | term
+    NFA build_from_charset(tree_node& node)
+    {
+        NFA nfa;
+        int i = 2;
+        if (node.childs[1].type == '^') {
+            if (node.childs.size() > 3) nfa = NFA(node.childs[2].type, nfa_state::CharsetNot);
+            else nfa = NFA('\0', nfa_state::CharsetNot); // [^]
+            i++;
+        } else {
+            nfa = NFA(node.childs[1].type, nfa_state::Charset);
+        }
+        for ( ; i < node.childs.size() - 1; i++) {
+            nfa.start->symbols.emplace(node.childs[i].type);
+        }
+        return nfa;
+    }
+    NFA build_from_escape(char c)
+    {
+        static const char *digit = "0123456789";
+        static const char *word = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
+        static const char *space = " \t\r\n\v\f";
+        bool charset_not = false;
+        const char *s;
+        switch (c) {
+        case 'd': s = digit; break;
+        case 'D': s = digit; charset_not = true; break;
+        case 'w': s = word; break;
+        case 'W': s = word; charset_not = true; break;
+        case 's': s = space; break;
+        case 'S': s = space; charset_not = true; break;
+        default: return NFA(c);
+        }
+        NFA nfa(*s++, charset_not ? nfa_state::CharsetNot : nfa_state::Charset);
+        while (*s) nfa.start->symbols.emplace(*s++);
+        return nfa;
+    }
+    // expr -> anchor '|' expr
+    //       | anchor
     tree_node expr()
     {
-        auto term_node = term();
+        auto anchor_node = anchor();
         if (!eof() && peek() == '|') {
             match('|');
-            return tree_node(Expr, { term_node, tree_node('|'), expr() });
+            return tree_node(Expr, { anchor_node, tree_node('|'), expr() });
         }
-        return tree_node(Expr, { term_node });
+        return tree_node(Expr, { anchor_node });
+    }
+    // anchor -> '^' anchor
+    //         | term '$'
+    //         | term
+    tree_node anchor()
+    {
+        if (!eof() && peek() == '^') {
+            match('^');
+            return tree_node(Anchor, { tree_node('^'), anchor() });
+        }
+        auto term_node = term();
+        if (!eof() && peek() == '$') {
+            match('$');
+            return tree_node(Anchor, { term_node, tree_node('$') });
+        }
+        return tree_node(Anchor, { term_node });
     }
     // term -> factor term
     //       | factor
@@ -301,7 +410,8 @@ private:
         auto factor_node = factor();
         // expr() needs to match '|'
         // atom() needs to match ')'
-        if (!eof() && peek() != '|' && peek() != ')') {
+        // anchor() needs to match '$'
+        if (!eof() && peek() != '|' && peek() != ')' && peek() != '$') {
             return tree_node(Term, { factor_node, term() });
         }
         return tree_node(Term, { factor_node });
@@ -316,7 +426,7 @@ private:
         }
         return tree_node(Factor, { atom_node });
     }
-    // atom -> char | (expr)
+    // atom -> char | (expr) | [charset]
     tree_node atom()
     {
         if (peek() == '(') {
@@ -324,6 +434,9 @@ private:
             auto expr_node = expr();
             match(')');
             return tree_node(Atom, { tree_node('('), expr_node, tree_node(')') });
+        }
+        if (peek() == '[') {
+            return charset();
         }
         return tree_node(Atom, { character() });
     }
@@ -335,6 +448,36 @@ private:
             return tree_node(Char, { tree_node('\\'), tree_node(nextchar()) });
         }
         return tree_node(Char, { tree_node(nextchar()) });
+    }
+    // expand like [a-z]
+    tree_node charset()
+    {
+        match('[');
+        if (eof()) throw parse_error;
+        tree_node charset_node(Atom);
+        charset_node.childs.emplace_back('[');
+        while (peek() != ']') {
+            char c = peek();
+            if (c == '\\') match('\\');
+            charset_node.childs.emplace_back(nextchar());
+            if (eof()) throw parse_error;
+            char c2 = peek();
+            if (c2 == ']') break;
+            if (c2 != '-') continue;
+            nextchar();
+            if (eof()) throw parse_error;
+            char c3 = peek();
+            if (c3 == ']') {
+                charset_node.childs.emplace_back(c2);
+                break;
+            }
+            if (c > c3) throw parse_error;
+            for (char cur = c + 1; cur <= c3; cur++)
+                charset_node.childs.emplace_back(cur);
+        }
+        match(']');
+        charset_node.childs.emplace_back(']');
+        return charset_node;
     }
 
     int peek() { return *p; }
@@ -361,6 +504,8 @@ public:
     }
     bool match(const std::string& s)
     {
+        if (nfa.start->is_anchor_start())
+            return search(nfa.start, s, 0);
         for (int i = 0; i < s.size(); i++)
             if (search(nfa.start, s, i))
                 return true;
@@ -370,13 +515,14 @@ private:
     // 朴素的DFS，最坏时间复杂度为O(2^n)
     bool search(nfa_state *state, const std::string& s, int i)
     {
-        if (state->isend) return true;
         if (i == s.size()) {
+            if (state->isend) return true;
             for (auto& state : state->epsilon_edges) {
                 if (search(state, s, i)) return true;
             }
         } else {
-            if ((state->symbol == '.' && s[i] != '\n') || state->symbol == s[i]) {
+            if (state->isend) return !state->is_anchor_end();
+            if (((state->is_anchor_start() && i == 0) || !state->is_anchor_start()) && state->can_symbol_trans(s[i])) {
                 if (search(state->to, s, i + 1)) return true;
             } else {
                 for (auto& state : state->epsilon_edges) {
